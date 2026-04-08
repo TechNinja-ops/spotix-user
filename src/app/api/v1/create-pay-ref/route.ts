@@ -32,6 +32,7 @@ export async function POST(request: NextRequest) {
       eventType,
       userFullName,
       userEmail: bodyUserEmail,
+      userPhone,
     } = body
 
     console.log("[create-pay-ref] Incoming body:", JSON.stringify({
@@ -43,7 +44,7 @@ export async function POST(request: NextRequest) {
       totalAmount,
       discountCode,
       referralCode,
-      guestEmail: guestEmail || null,
+      userEmail: bodyUserEmail || guestEmail || null,
     }, null, 2))
 
     // ── Auth — optional for guests ─────────────────────────────────────────────
@@ -119,11 +120,17 @@ export async function POST(request: NextRequest) {
     console.log(`[create-pay-ref] Generated reference: ${reference}`)
 
     // ── Build Firestore document ───────────────────────────────────────────────
+    // Use userEmail/userFullName for both authenticated and guest users
+    const finalUserEmail = userEmail || bodyUserEmail || guestEmail || null
+    const finalUserFullName = userFullName || guestFullName || null
+    const finalUserPhone = userPhone || guestPhone || null
+
     const paymentReference = {
       reference,
       userId: userId || null,
-      userEmail: userEmail || bodyUserEmail || guestEmail || null,
-      userFullName: userFullName || null,
+      userEmail: finalUserEmail,
+      userFullName: finalUserFullName,
+      userPhone: finalUserPhone || null,
       eventId,
       eventCreatorId,
       eventName: eventName || "",
@@ -149,13 +156,6 @@ export async function POST(request: NextRequest) {
       paymentCreationDate: new Date().toISOString(),
       paymentCreationTimestamp: timestamp,
 
-      // Guest fields
-      ...(guestEmail && {
-        guestEmail,
-        guestFullName: guestFullName || null,
-        guestPhone: guestPhone || null,
-      }),
-
       // Discount / referral
       discountCode: discountCode || null,
       discountData: discountData || null,
@@ -172,7 +172,8 @@ export async function POST(request: NextRequest) {
       totalAmount: paymentReference.totalAmount,
       totalTicketCount,
       userId: paymentReference.userId,
-      guestEmail: paymentReference.guestEmail || null,
+      userEmail: paymentReference.userEmail,
+      userFullName: paymentReference.userFullName,
     }, null, 2))
 
     const referenceDocRef = adminDb.collection("Reference").doc(reference)
