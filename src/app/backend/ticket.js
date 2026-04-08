@@ -98,33 +98,11 @@ export default async function ticketRoute(fastify, options) {
       }
 
       // ─── Resolve buyer display data ────────────────────────────────────────────
-      let buyerFullName = "";
-      let buyerEmail = "";
-      let buyerPhone = "";
-
-      if (!isGuest) {
-        // Authenticated user — fetch from Firestore
-        const userDocRef = adminDb.collection("users").doc(paymentData.userId);
-        const userDoc = await userDocRef.get();
-
-        if (!userDoc.exists) {
-          return reply.code(404).send({
-            error: "User Not Found",
-            message: "User data not found. Please contact support.",
-            developer: "API developed and maintained by Spotix Technologies",
-          });
-        }
-
-        const userData = userDoc.data();
-        buyerFullName = userData.fullName || userData.username || "";
-        buyerEmail = userData.email || "";
-        buyerPhone = userData.phoneNumber || "";
-      } else {
-        // Guest — use data stored on the reference
-        buyerFullName = paymentData.guestFullName || "";
-        buyerEmail = paymentData.guestEmail || paymentData.userEmail || "";
-        buyerPhone = paymentData.guestPhone || "";
-      }
+      // Both authenticated users and guests have data stored on the reference
+      // No need to fetch from users collection — the reference has the full name and phone
+      const buyerFullName = paymentData.userFullName || "Valued Customer";
+      const buyerEmail = paymentData.userEmail || paymentData.guestEmail || "";
+      const buyerPhone = paymentData.userPhone || paymentData.guestPhone || "";
 
       // ─── Step 2: Build the list of tickets to generate ────────────────────────
       // ticketTypes is an array of { type, quantity, price } objects stored on the reference.
@@ -397,6 +375,7 @@ export default async function ticketRoute(fastify, options) {
               ticketPrice: paymentData.totalAmount || paymentData.ticketPrice,
               ticketId: createdTicketIds[0],
               ticketCount: totalTicketCount,
+              transactionFee: paymentData.transactionFee || 0,
               eventId: paymentData.eventId,
               timestamp: now.toISOString(),
             }),

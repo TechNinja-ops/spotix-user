@@ -12,6 +12,7 @@ export async function POST(request: NextRequest) {
       ticketType,       // legacy single-type field (kept for backwards compat)
       ticketTypes,      // primary: [{ type, quantity, price }]
       totalAmount,
+      transactionFee,   // VAT/transaction fee from orderSummary
       discountCode,
       discountData,
       referralCode,
@@ -153,6 +154,7 @@ export async function POST(request: NextRequest) {
       ticketType: primaryTicketType,          // convenience / backwards compat
       ticketPrice: Number(ticketPrice),       // subtotal before VAT (used for display)
       totalAmount: Number(totalAmount),       // grand total inc. VAT after discount
+      transactionFee: Number(transactionFee) || 0, // VAT/fee sent from orderSummary
       totalTicketCount,
 
       vendor: "paystack",
