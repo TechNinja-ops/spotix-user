@@ -64,9 +64,14 @@ export async function POST(request: NextRequest) {
       }
     }
 
-    if (!userId && !guestEmail) {
+    // Use bodyUserEmail (from guest checkout form) if no authenticated userId
+    // For guests, the email serves as their identifier
+    const finalUserEmail = userEmail || bodyUserEmail || guestEmail || null
+    const finalUserId = userId || (finalUserEmail ? finalUserEmail : null) // Use email as ID for guests
+
+    if (!finalUserId && !finalUserEmail) {
       return NextResponse.json(
-        { error: "Either authentication or guest email is required" },
+        { error: "Either authentication or user email is required" },
         { status: 400 }
       )
     }
@@ -120,14 +125,13 @@ export async function POST(request: NextRequest) {
     console.log(`[create-pay-ref] Generated reference: ${reference}`)
 
     // ── Build Firestore document ───────────────────────────────────────────────
-    // Use userEmail/userFullName for both authenticated and guest users
-    const finalUserEmail = userEmail || bodyUserEmail || guestEmail || null
+    // Use finalUserEmail/userFullName/userPhone already defined above
     const finalUserFullName = userFullName || guestFullName || null
     const finalUserPhone = userPhone || guestPhone || null
 
     const paymentReference = {
       reference,
-      userId: userId || null,
+      userId: finalUserId, // Use email as ID for guests if no userId
       userEmail: finalUserEmail,
       userFullName: finalUserFullName,
       userPhone: finalUserPhone || null,
@@ -171,9 +175,9 @@ export async function POST(request: NextRequest) {
       ticketTypes: normalisedTicketTypes,
       totalAmount: paymentReference.totalAmount,
       totalTicketCount,
-      userId: paymentReference.userId,
-      userEmail: paymentReference.userEmail,
-      userFullName: paymentReference.userFullName,
+      userId: finalUserId,
+      userEmail: finalUserEmail,
+      userFullName: finalUserFullName,
     }, null, 2))
 
     const referenceDocRef = adminDb.collection("Reference").doc(reference)
