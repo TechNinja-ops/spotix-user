@@ -13,11 +13,160 @@ export default async function ticketRoute(fastify, options) {
    * Creates one ticket per item in the reference's ticketTypes array
    */
   fastify.post("/ticket", async (request, reply) => {
+    try {
+      const { reference } = request.body;
+
+      if (!reference) {
+        return reply.code(400).send({
+          error: "Bad Request",
+          message: "Missing required field: reference",
+          developer: "API developed and maintained by Spotix Technologies",
+        });
+      }
+
+      // ─── Step 1: Verify payment status with retry logic ───────────────────────
+      let paymentData = null;
+      let attempts = 0;
+      const maxAttempts = 3;
+      const referenceDocRef = adminDb.collection("Reference").doc(reference);
+
+      while (attempts < maxAttempts) {
+        const referenceDoc = await referenceDocRef.get();
+
+        if (!referenceDoc.exists) {
+          return reply.code(404).send({
+            error: "Not Found",
+            message: "Payment reference not found",
+            reference,
+            developer: "API developed and maintained by Spotix Technologies",
+          });
+        }
+
+        paymentData = referenceDoc.data();
+
+        if (paymentData.status === "completed") {
+          break;
+        } else if (paymentData.status === "pending") {
+          attempts++;
+          if (attempts < maxAttempts) {
+            await new Promise((resolve) => setTimeout(resolve, 2000));
+          }
+        } else {
+          return reply.code(400).send({
+            error: "Bad Request",
+            message: `Invalid payment status: ${paymentData.status}`,
+            reference,
+            developer: "API developed and maintained by Spotix Technologies",
+          });
+        }
+      }
+
+      if (!paymentData || paymentData.status !== "completed") {
+        return reply.code(400).send({
+          error: "Bad Request",
+          message: "Payment still pending after retries",
+          reference,
+          developer: "API developed and maintained by Spotix Technologies",
+        });
+      }
+
+      // ─── Step 2: Expand tickets based on ticketTypes ────────────────────────────
+      const ticketTypesArray = paymentData.ticketTypes || [];
+
+      if (!Array.isArray(ticketTypesArray) || ticketTypesArray.length === 0) {
+        return reply.code(400).send({
+          error: "Bad Request",
+          message: "No ticket types found in reference",
+          reference,
+          developer: "API developed and maintained by Spotix Technologies",
+        });
+      }
+
+      const ticketSeats = [];
+      for (const item of ticketTypesArray) {
+        const qty = Number(item.quantity) || 1;
+        for (let i = 0; i < qty; i++) {
+          ticketSeats.push({
+            type: item.type,
+            price: item.price,
+          });
+        }
+      }
+
+      const totalTicketCount = ticketSeats.length;
+
+      // ─── Step 3: Generate / retrieve all ticket IDs atomically ───────────────
+      const now = new Date();
+      const purchaseTime = now.toLocaleString("en-US", {
+        timeZone: "Africa/Lagos",
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit",
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+      });
+
+      let ticketIds = [];
+      const createdTicketIds = [];
+
+      const refData = await referenceDocRef.get().then((doc) => doc.data());
+
+      if (refData?.ticketIds) {
+        ticketIds = refData.ticketIds;
+      } else {
+        ticketIds = ticketSeats.map(() => generateTicketId());
+
+        await referenceDocRef.update({
+          ticketIds: ticketIds,
+        });
+      }
+
+      // ─── Step 4: Resolve buyer display data ───────────────────────────────────
+      const buyerFullName = paymentData.userFullName || "Valued Customer";
+      const buyerEmail = paymentData.userEmail || paymentData.guestEmail || "";
+      const buyerPhone = paymentData.userPhone || paymentData.guestPhone || "";
+      const isGuest = !paymentData.userId;
+
+      if (!buyerEmail) {
+        return reply.code(400).send({
+          error: "Bad Request",
+          message: "Buyer email not found in reference",
+          reference,
+          developer: "API developed and maintained by Spotix Technologies",
+        });
+      }
+
+      // ─── Step 5: Create individual ticket documents ────────────────────────────
+      for (let i = 0; i < ticketIds.length; i++) {
+        const ticketId = ticketIds[i];
+        const seat = ticketSeats[i];
+
+        const ticketDoc = {
+          ticketId,
+          ticketType: seat.type,
+          price: seat.price,
+          reference,
+          eventId: paymentData.eventId,
+          eventName: paymentData.eventName,
+          eventCreatorId: paymentData.eventCreatorId,
+          buyerFullName,
+          buyerEmail,
+          buyerPhone,
+          userId: paymentData.userId || null,
+          isGuest,
+          validFrom: new Date().toISOString(),
+          status: "active",
+          createdAt: now.toISOString(),
+          purchaseTime,
+        };
+
         try {
           await adminDb.collection("tickets").doc(ticketId).set(ticketDoc);
         } catch (error) {
           if (error.code === "ALREADY_EXISTS") {
             // Ticket already exists from previous attempt, skip
+          }
         }
 
         // Step 6: Attendee record — events/{eventId}/attendees/{ticketId}
@@ -31,24 +180,19 @@ export default async function ticketRoute(fastify, options) {
 
         if (!attendeeSnap.exists) {
           await attendeeRef.set(ticketDoc);
-          fastify.log.info(`Attendee written to events/${paymentData.eventId}/attendees/${ticketId}`);
         } else {
-          fastify.log.info(`Attendee ${ticketId} already exists — skipping`);
+          // Attendee already exists from previous attempt
         }
 
         createdTicketIds.push(ticketId);
       }
 
-      // ─── Step 7: Atomic operations (stats / discounts) ────────────────────────
+      // ─── Step 7: Atomic operations (stats / discounts) ────────────────────────────
       try {
         const ATOMIC_API_URL = process.env.ATOMIC_API_URL;
 
         if (ATOMIC_API_URL) {
-          fastify.log.info("Calling atomic operations API");
-
           // Build a map of ticketType -> first ticketId assigned to that type.
-          // ticketSeats is expanded in the same order as ticketIds, so we walk
-          // them once to find the first index for each unique type.
           const typeToFirstTicketId = {};
           for (let i = 0; i < ticketSeats.length; i++) {
             const type = ticketSeats[i].type;
@@ -64,7 +208,7 @@ export default async function ticketRoute(fastify, options) {
               method: "POST",
               headers: { "Content-Type": "application/json" },
               body: JSON.stringify({
-                ticketId: idempotencyKey,           // first ticketId for this ticket type
+                ticketId: idempotencyKey,
                 creatorId: paymentData.eventCreatorId,
                 eventId: paymentData.eventId,
                 ticketType: item.type,
@@ -74,22 +218,13 @@ export default async function ticketRoute(fastify, options) {
               }),
             });
 
-            if (atomicResponse.ok) {
-              const atomicResult = await atomicResponse.json();
-              if (atomicResult.alreadyProcessed) {
-                fastify.log.info(`Atomic ops already processed for type: ${item.type}`);
-              } else {
-                fastify.log.info(`Atomic ops done for type: ${item.type}`);
-              }
-            } else {
-              fastify.log.warn(`Atomic API returned ${atomicResponse.status} for type ${item.type}`);
+            if (!atomicResponse.ok) {
+              // Non-blocking failure
             }
           }
-        } else {
-          fastify.log.warn("ATOMIC_API_URL not configured - skipping atomic operations");
         }
       } catch (atomicError) {
-        fastify.log.error("Error calling atomic operations API (non-blocking):", atomicError);
+        // Non-blocking error
       }
 
       // ─── Step 8: Update referral usage — events/{eventId}/referrals/{code} ────
@@ -106,7 +241,6 @@ export default async function ticketRoute(fastify, options) {
           const referralDoc = await referralDocRef.get();
 
           if (referralDoc.exists) {
-            // Record one usage entry per ticket generated
             const usageEntries = createdTicketIds.map((tid, idx) => ({
               name: buyerFullName || "Unknown",
               ticketType: ticketSeats[idx].type,
@@ -118,15 +252,13 @@ export default async function ticketRoute(fastify, options) {
               usages: FieldValue.arrayUnion(...usageEntries),
               totalTickets: FieldValue.increment(totalTicketCount),
             });
-
-            fastify.log.info(`Referral ${referralCode} updated with ${totalTicketCount} ticket(s)`);
           }
         } catch (error) {
-          fastify.log.error("Error updating referral (non-blocking):", error);
+          // Non-blocking error
         }
       }
 
-      // ─── Step 9: Admin daily sales aggregation (unchanged path, quantity-aware) ─
+      // ─── Step 9: Admin daily sales aggregation ────────────────────────────────
       const purchaseDateFormatted = now.toISOString().split("T")[0];
       const adminSalesRef = adminDb
         .collection("admin")
@@ -147,7 +279,6 @@ export default async function ticketRoute(fastify, options) {
               createdAt: now.toISOString(),
               updatedAt: now.toISOString(),
             });
-            fastify.log.info(`Created daily sales record for ${purchaseDateFormatted}`);
           } else {
             transaction.update(adminSalesRef, {
               ticketCount: FieldValue.increment(totalTicketCount),
@@ -155,25 +286,22 @@ export default async function ticketRoute(fastify, options) {
               lastPurchaseTime: purchaseTime,
               updatedAt: now.toISOString(),
             });
-            fastify.log.info(`Updated daily sales record for ${purchaseDateFormatted}`);
           }
         });
       } catch (error) {
-        fastify.log.error("Error updating daily sales aggregation (non-blocking):", error);
+        // Non-blocking error
       }
 
       // ─── Step 10: Mark reference as fully generated ────────────────────────────
       await referenceDocRef.update({
         ticketGenerated: true,
         ticketGeneratedAt: now.toISOString(),
-        generatedTicketIds: createdTicketIds,   // all IDs written in this run
+        generatedTicketIds: createdTicketIds,
         totalTicketsGenerated: totalTicketCount,
         updatedAt: now.toISOString(),
       });
 
-      fastify.log.info(`Reference ${reference} marked complete — ${totalTicketCount} ticket(s) generated`);
-
-      // ─── Step 11: Global analytics ───────────────────────────────���────────────
+      // ─── Step 11: Global analytics ─────────────────────────────────────────────
       try {
         const ANALYTICS_FUNCTION_URL = process.env.ANALYTICS_FUNCTION_URL;
 
@@ -191,28 +319,19 @@ export default async function ticketRoute(fastify, options) {
             }),
           });
 
-          if (analyticsResponse.ok) {
-            const analyticsResult = await analyticsResponse.json();
-            if (analyticsResult.alreadyProcessed) {
-              fastify.log.info(`Analytics already processed for reference ${reference}`);
-            } else {
-              fastify.log.info("Analytics updated successfully");
-            }
-          } else {
-            fastify.log.warn("Failed to update analytics — tickets still created");
+          if (!analyticsResponse.ok) {
+            // Non-blocking failure
           }
-        } else {
-          fastify.log.warn("ANALYTICS_FUNCTION_URL not configured — skipping analytics");
         }
       } catch (analyticsError) {
-        fastify.log.error("Error updating analytics (non-blocking):", analyticsError);
+        // Non-blocking error
       }
 
-      // ─── Step 12: Confirmation email ──────────────────────────────────────────────
+      // ─── Step 12: Confirmation email (ONLY ONE EMAIL) ──────────────────────────
+      // Send only ONE email per order, using the email from reference
       try {
         const BACKEND_URL = process.env.BACKEND_URL || "http://localhost:5000";
 
-        // Summarise all ticket types purchased for the email
         const ticketTypeSummary = ticketTypesArray
           .map((item) => `${item.type}${Number(item.quantity) > 1 ? ` x${item.quantity}` : ""}`)
           .join(", ");
@@ -235,16 +354,13 @@ export default async function ticketRoute(fastify, options) {
           payment_method: "Paystack",
         };
 
-        fastify.log.info("[email] Payload being sent to mail service:");
-        fastify.log.info(JSON.stringify(emailPayload, null, 2));
-        fastify.log.info(`[email] Endpoint: ${BACKEND_URL}/v1/mail/payment-confirmation`);
-        fastify.log.info(`[email] buyerEmail resolved to: "${buyerEmail}"`);
-        fastify.log.info(`[email] buyerFullName resolved to: "${buyerFullName}"`);
-        fastify.log.info(`[email] ticketTypesArray at email time: ${JSON.stringify(ticketTypesArray)}`);
-        fastify.log.info(`[email] createdTicketIds: ${JSON.stringify(createdTicketIds)}`);
-        fastify.log.info(`[email] totalTicketCount: ${totalTicketCount}`);
-        fastify.log.info(`[email] totalAmount on paymentData: ${paymentData.totalAmount}`);
-        fastify.log.info(`[email] ticketPrice on paymentData: ${paymentData.ticketPrice}`);
+        fastify.log.info("[email] Attempting to send confirmation email...");
+        fastify.log.info("[email] Payload:", JSON.stringify(emailPayload, null, 2));
+        fastify.log.info(`[email] To: ${buyerEmail}`);
+        fastify.log.info(`[email] Name: ${buyerFullName}`);
+        fastify.log.info(`[email] Ticket IDs count: ${createdTicketIds.length}`);
+        fastify.log.info(`[email] Total amount: ${totalAmountForEmail}`);
+        fastify.log.info(`[email] Endpoint: POST ${BACKEND_URL}/v1/mail/payment-confirmation`);
 
         const emailResponse = await fetch(`${BACKEND_URL}/v1/mail/payment-confirmation`, {
           method: "POST",
@@ -252,14 +368,18 @@ export default async function ticketRoute(fastify, options) {
           body: JSON.stringify(emailPayload),
         });
 
+        const emailResponseText = await emailResponse.text();
+        fastify.log.info(`[email] Response status: ${emailResponse.status}`);
+        fastify.log.info(`[email] Response body: ${emailResponseText}`);
+
         if (emailResponse.ok) {
-          fastify.log.info("[email] Confirmation email sent successfully");
+          fastify.log.info("[email] Email sent successfully");
         } else {
-          const errorText = await emailResponse.text().catch(() => "(could not read body)");
-          fastify.log.warn(`[email] Failed — status: ${emailResponse.status}, body: ${errorText}`);
+          fastify.log.warn(`[email] Failed to send email — status: ${emailResponse.status}`);
+          fastify.log.warn(`[email] Response: ${emailResponseText}`);
         }
-      } catch (error) {
-        fastify.log.error("[email] Error sending confirmation email (non-blocking):", error);
+      } catch (emailError) {
+        fastify.log.error("[email] Error sending confirmation email:", emailError.message);
       }
 
       // ─── Step 13: Success response ────────────────────────────────────────────
@@ -291,11 +411,8 @@ export default async function ticketRoute(fastify, options) {
         referralUsed: !!paymentData.referralCode,
         developer: "API developed and maintained by Spotix Technologies",
       });
-
     } catch (error) {
-      fastify.log.error("Ticket generation error:", JSON.stringify(error, Object.getOwnPropertyNames(error)));
-      fastify.log.error("Error message:", error?.message);
-      fastify.log.error("Error stack:", error?.stack);
+      fastify.log.error("Ticket generation error:", error.message);
 
       return reply.code(500).send({
         error: "Internal Server Error",
